@@ -1,4 +1,4 @@
-# Raspberry Pi 5 Vision + Distance Selector System
+# Raspberry Pi 5 Vision + Distance + Room Summary Selector System
 
 This project runs continuously and uses two switches:
 
@@ -13,6 +13,10 @@ Selector functions:
 2. Distance function (new behavior): HC-SR04 distance check.  
    If distance `< 150 cm`, motor pin 36 and LED pin 13 pulse.  
    Pulse frequency increases as object gets closer.
+3. Room summary function: capture a USB camera frame -> Gemini returns a minimal room summary -> summary is converted to Morse on:
+   - LED pin 11
+   - Motor pin 36
+   The Gemini prompt is constrained to produce a short Morse-safe uppercase description such as `BED CHAIR TABLE`.
 
 The program prints switch press events and live status updates in terminal.
 
@@ -46,6 +50,7 @@ Edit `.env`:
 
 - `GEMINI_API_KEY` (required)
 - `DECISION_QUESTION` (defaults to human presence question)
+- `ROOM_DESCRIPTION_PROMPT` (defaults to a minimal room-summary prompt for Morse output)
 - Camera settings (`CAMERA_DEVICE=/dev/video0` recommended for USB camera)
 - Pin settings if your wiring differs
 
@@ -78,6 +83,8 @@ Typical runtime logs:
 [10:21:22] Vision result: YES | Morse: -.-- . ...
 [10:21:30] Switch 2 (pin 31) pressed -> Selected Function 2: HC-SR04 Distance Alert
 [10:21:31] Function 2: distance=92.6 cm | threshold=150.0 cm | alert=ON
+[10:21:38] Switch 2 (pin 31) pressed -> Selected Function 3: Room Summary To Morse
+[10:21:39] Room summary: BED CHAIR TABLE | Morse: -... . -.. / -.-. .... .- .. .-. / - .- -... .-.. .
 ```
 
 ## 5. API key check

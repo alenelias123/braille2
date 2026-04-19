@@ -65,6 +65,7 @@ class AppConfig:
     api_key: str
     model: str
     decision_question: str
+    room_description_prompt: str
     camera_index: int
     camera_device: str
     camera_backends: str
@@ -139,6 +140,13 @@ def load_config() -> AppConfig:
         api_key=api_key,
         model=os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite-preview").strip(),
         decision_question=decision_question,
+        room_description_prompt=os.getenv(
+            "ROOM_DESCRIPTION_PROMPT",
+            (
+                "Describe the contents in the room in the most minimalistic manner "
+                "such that Morse code is enough for the user to understand the scene."
+            ),
+        ).strip(),
         camera_index=int(os.getenv("CAMERA_INDEX", "0")),
         camera_device=os.getenv("CAMERA_DEVICE", "").strip(),
         camera_backends=os.getenv("CAMERA_BACKENDS", "V4L2,ANY").strip(),
@@ -430,6 +438,56 @@ def ask_gemini_yes_no(config: AppConfig, image_bytes: bytes) -> str:
     )
 
 
+def ask_gemini_room_summary(config: AppConfig, image_bytes: bytes) -> str:
+    url = f"{GEMINI_API_BASE}/{config.model}:generateContent"
+    image_b64 = base64.b64encode(image_bytes).decode("utf-8")
+    prompt = (
+        f"{config.room_description_prompt}\n"
+        "Rules:\n"
+        "- Output only uppercase words separated by single spaces.\n"
+        "- Use only letters A-Z, digits 0-9, and spaces.\n"
+        "- No punctuation, bullets, or full sentences.\n"
+        "- Keep it extremely short: 2 to 6 words.\n"
+        "- Mention only the most important visible items, people, or furniture.\n"
+        "- Prefer concrete nouns over adjectives.\n"
+        "- If the scene is unclear, output UNKNOWN.\n"
+        "Examples of valid outputs:\n"
+        "BED CHAIR TABLE\n"
+        "PERSON DESK LAPTOP\n"
+        "DOOR WINDOW BAG"
+    )
+
+    payload = {
+        "contents": [
+            {
+                "parts": [
+                    {"text": prompt},
+                    {
+                        "inline_data": {
+                            "mime_type": "image/jpeg",
+                            "data": image_b64,
+                        }
+                    },
+                ]
+            }
+        ],
+        "generationConfig": {
+            "temperature": 0.2,
+            "maxOutputTokens": 64,
+            "responseMimeType": "text/plain",
+        },
+    }
+
+    data = request_gemini(config, url, payload)
+    text = extract_text(data)
+    if not text:
+        raise ValueError(
+            "Gemini returned no room description text. "
+            f"finishReason={first_finish_reason(data)!r}, response={data}"
+        )
+    return normalize_morse_text(text)
+
+
 def first_finish_reason(api_data: dict) -> str:
     candidates = api_data.get("candidates") or []
     if not candidates:
@@ -458,6 +516,15 @@ def parse_yes_no(text: str) -> str:
     if len(unique) == 1:
         return unique[0]
     raise ValueError(f"Model did not return a clear YES/NO. Raw response: {text!r}")
+
+
+def normalize_morse_text(text: str) -> str:
+    normalized = text.upper().strip()
+    normalized = re.sub(r"[^A-Z0-9\s]", " ", normalized)
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    if not normalized:
+        raise ValueError(f"Model did not return Morse-safe text. Raw response: {text!r}")
+    return normalized
 
 
 def text_to_morse(text: str) -> str:
@@ -617,6 +684,14 @@ def run_vision_check(config: AppConfig) -> Tuple[str, str]:
     return decision, morse
 
 
+def run_room_description_check(config: AppConfig) -> Tuple[str, str]:
+    image = capture_frame(config)
+    summary = ask_gemini_room_summary(config, image)
+    morse = text_to_morse(summary)
+    log(f"Room summary: {summary} | Morse: {morse}")
+    return summary, morse
+
+
 def main() -> None:
     config = load_config()
     setup_gpio(config)
@@ -633,6 +708,7 @@ def main() -> None:
     selector_labels = [
         "Function 1: Vision Human Check",
         "Function 2: HC-SR04 Distance Alert",
+        "Function 3: Room Summary To Morse",
     ]
     pulse_state = PulseState()
     last_vision_at = 0.0
@@ -640,6 +716,8 @@ def main() -> None:
     last_distance_read_at = 0.0
     last_distance_log_at = 0.0
     last_distance_cm: Optional[float] = None
+    last_room_summary_at = 0.0
+    last_room_summary: Optional[str] = None
 
     log("System ready.")
     log(
@@ -666,6 +744,7 @@ def main() -> None:
                 last_distance_cm = None
                 last_distance_read_at = 0.0
                 last_distance_log_at = 0.0
+                last_room_summary_at = 0.0
                 if mode1_enabled:
                     selector_index = None
                     log("Mode 1 active. Press Switch 2 to select function.")
@@ -692,10 +771,12 @@ def main() -> None:
                     pulse_state = PulseState()
                     if selector_index == 0:
                         last_vision_at = 0.0
-                    else:
+                    elif selector_index == 1:
                         last_distance_cm = None
                         last_distance_read_at = 0.0
                         last_distance_log_at = 0.0
+                    else:
+                        last_room_summary_at = 0.0
 
             if not mode1_enabled or selector_index is None:
                 time.sleep(config.main_loop_sleep_seconds)
@@ -720,7 +801,7 @@ def main() -> None:
                     last_vision_at = time.monotonic()
                 else:
                     time.sleep(config.main_loop_sleep_seconds)
-            else:
+            elif selector_index == 1:
                 if now - last_distance_read_at >= config.distance_read_interval_seconds:
                     last_distance_cm = measure_distance_cm(config)
                     last_distance_read_at = now
@@ -740,6 +821,25 @@ def main() -> None:
                     last_distance_log_at = now
 
                 time.sleep(config.main_loop_sleep_seconds)
+            else:
+                if now - last_room_summary_at >= config.vision_interval_seconds:
+                    log("Running Function 3: capture + Gemini room summary")
+                    try:
+                        summary, morse = run_room_description_check(config)
+                        if summary == last_room_summary and not config.repeat_same_morse:
+                            log(
+                                "Room summary unchanged and REPEAT_SAME_MORSE=false, skipping repeated Morse."
+                            )
+                        else:
+                            signal_morse(config, morse)
+                        last_room_summary = summary
+                    except Exception as exc:
+                        log(f"Function 3 error: {exc}")
+                    finally:
+                        clear_all_outputs(config)
+                    last_room_summary_at = time.monotonic()
+                else:
+                    time.sleep(config.main_loop_sleep_seconds)
     except KeyboardInterrupt:
         log("Keyboard interrupt received, shutting down.")
     finally:
