@@ -208,11 +208,12 @@ def ask_gemini_yes_no(config: AppConfig, image_bytes: bytes) -> str:
     url = f"{GEMINI_API_BASE}/{config.model}:generateContent"
     image_b64 = base64.b64encode(image_bytes).decode("utf-8")
     prompt = (
-        "You must answer with exactly one word: YES or NO.\n"
+        "Answer with exactly one token: YES or NO.\n"
+        "Do not include explanation or punctuation.\n"
         f"Question: {config.decision_question}"
     )
 
-    payload = {
+    base_payload = {
         "contents": [
             {
                 "parts": [
@@ -228,38 +229,89 @@ def ask_gemini_yes_no(config: AppConfig, image_bytes: bytes) -> str:
         ],
         "generationConfig": {
             "temperature": 0,
-            "maxOutputTokens": 4,
+            "maxOutputTokens": 32,
+            "responseMimeType": "text/plain",
         },
     }
 
+    last_data: dict = {}
+    for max_tokens in (32, 128):
+        payload = dict(base_payload)
+        payload["generationConfig"] = dict(base_payload["generationConfig"])
+        payload["generationConfig"]["maxOutputTokens"] = max_tokens
+
+        data = request_gemini(config, url, payload)
+        last_data = data
+
+        text = extract_text(data)
+        if text:
+            return parse_yes_no(text)
+
+        if first_finish_reason(data) != "MAX_TOKENS":
+            break
+
+    raise ValueError(
+        "Gemini returned no text response. "
+        f"finishReason={first_finish_reason(last_data)!r}, response={last_data}"
+    )
+
+
+def request_gemini(config: AppConfig, url: str, payload: dict) -> dict:
     response = requests.post(
         url,
         json=payload,
         headers={"x-goog-api-key": config.api_key},
         timeout=30,
     )
-    response.raise_for_status()
-    data = response.json()
+    # Fallback: some environments only accept key as query parameter.
+    if response.status_code == 401:
+        response = requests.post(
+            url,
+            params={"key": config.api_key},
+            json=payload,
+            timeout=30,
+        )
 
-    text = extract_text(data)
-    decision = parse_yes_no(text)
-    return decision
+    if not response.ok:
+        body = response.text[:500]
+        hint = ""
+        if response.status_code == 401:
+            hint = (
+                " Unauthorized. Check GEMINI_API_KEY in .env, regenerate the key, "
+                "and make sure no extra spaces/quotes are present."
+            )
+        elif response.status_code == 403:
+            hint = (
+                " Forbidden. API key may be restricted or Gemini API access is not enabled."
+            )
+        elif response.status_code == 404:
+            hint = (
+                f" Model not found or unavailable: {config.model}. "
+                "Try a currently available model (for example gemini-2.5-flash)."
+            )
+        raise RuntimeError(
+            f"Gemini API request failed with HTTP {response.status_code}.{hint} "
+            f"Response body (truncated): {body}"
+        )
+    return response.json()
+
+
+def first_finish_reason(api_data: dict) -> str:
+    candidates = api_data.get("candidates") or []
+    if not candidates:
+        return ""
+    return str(candidates[0].get("finishReason") or "")
 
 
 def extract_text(api_data: dict) -> str:
-    try:
-        candidates = api_data["candidates"]
-        if not candidates:
-            raise ValueError("No candidates in response.")
-        parts = candidates[0]["content"]["parts"]
-        if not parts:
-            raise ValueError("No text parts in response.")
+    candidates = api_data.get("candidates") or []
+    for candidate in candidates:
+        content = candidate.get("content") or {}
+        parts = content.get("parts") or []
         text = "".join(part.get("text", "") for part in parts).strip()
-        if not text:
-            raise ValueError("Empty text in model response.")
-        return text
-    except Exception as exc:
-        raise ValueError(f"Unexpected Gemini response format: {api_data}") from exc
+        if text:
+            return text
+    return ""
 
 
 def parse_yes_no(text: str) -> str:

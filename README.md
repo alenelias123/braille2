@@ -47,6 +47,24 @@ Edit `.env`:
 python3 main.py
 ```
 
+## API Key / Model Check
+
+Before full run, validate your key and model access:
+
+```bash
+source .env
+curl -sS "https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent" \
+  -H "x-goog-api-key: ${GEMINI_API_KEY}" \
+  -H "Content-Type: application/json" \
+  -d '{"contents":[{"parts":[{"text":"Reply YES"}]}]}' | head -c 400
+echo
+```
+
+If this returns an auth error:
+- Regenerate API key in Google AI Studio
+- Ensure `.env` has no quotes/spaces around `GEMINI_API_KEY`
+- Confirm the chosen model is available to your key
+
 Expected terminal output:
 
 ```text
