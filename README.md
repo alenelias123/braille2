@@ -2,16 +2,16 @@
 
 This project runs continuously and uses two switches:
 
-- Switch 1 (`MODE_SWITCH_PIN`, requested pin 12): toggles **Mode 1** ON/OFF
-- Switch 2 (`SELECTOR_SWITCH_PIN`, requested pin 14): cycles selector functions when Mode 1 is ON
+- Switch 1 (`MODE_SWITCH_PIN`, pin 29): toggles **Mode 1** ON/OFF
+- Switch 2 (`SELECTOR_SWITCH_PIN`, pin 31): cycles selector functions when Mode 1 is ON
 
 Selector functions:
 
 1. Vision function (existing behavior): capture camera frame -> Gemini YES/NO -> Morse on:
-   - LED pin 16
-   - Motor pin 13
+   - LED pin 11
+   - Motor pin 36
 2. Distance function (new behavior): HC-SR04 distance check.  
-   If distance `< 150 cm`, motor pin 13 and LED pin 19 pulse.  
+   If distance `< 150 cm`, motor pin 36 and LED pin 13 pulse.  
    Pulse frequency increases as object gets closer.
 
 The program prints switch press events and live status updates in terminal.
@@ -49,20 +49,20 @@ Edit `.env`:
 - Camera settings (`CAMERA_DEVICE=/dev/video0` recommended for USB camera)
 - Pin settings if your wiring differs
 
-## 3. Pin mapping notes (important)
+## 3. Pin mapping
 
 With `PIN_MODE=BOARD`:
 
-- Requested `pin 12` is valid GPIO
-- Requested `pin 14` is **GND**, not GPIO
-- Requested `pin 34` is **GND**, not GPIO
+- LED 1: `LED_PIN=11`
+- LED 2: `AUX_LED_PIN=13`
+- Motor: `MOTOR_PIN=36`
+- Switch 1: `MODE_SWITCH_PIN=29`
+- Switch 2: `SELECTOR_SWITCH_PIN=31`
+- HC-SR04 trigger: `HCSR04_TRIGGER_PIN=16`
+- HC-SR04 echo: `HCSR04_ECHO_PIN=18`
+- HC-SR04 VCC: physical pin `2` (5V)
 
-Because of that, `.env.example` uses safe GPIO-capable defaults:
-
-- `SELECTOR_SWITCH_PIN=15` (instead of 14)
-- `HCSR04_ECHO_PIN=36` (instead of 34)
-
-If your hardware is wired differently, update `.env` accordingly.
+These are the defaults in `.env.example`. If your hardware is wired differently, update `.env` accordingly.
 
 ## 4. Run
 
@@ -73,10 +73,10 @@ python3 main.py
 Typical runtime logs:
 
 ```text
-[10:21:18] Switch 1 (pin 12) pressed -> Mode 1 ENABLED
-[10:21:22] Switch 2 (pin 15) pressed -> Selected Function 1: Vision Human Check
+[10:21:18] Switch 1 (pin 29) pressed -> Mode 1 ENABLED
+[10:21:22] Switch 2 (pin 31) pressed -> Selected Function 1: Vision Human Check
 [10:21:22] Vision result: YES | Morse: -.-- . ...
-[10:21:30] Switch 2 (pin 15) pressed -> Selected Function 2: HC-SR04 Distance Alert
+[10:21:30] Switch 2 (pin 31) pressed -> Selected Function 2: HC-SR04 Distance Alert
 [10:21:31] Function 2: distance=92.6 cm | threshold=150.0 cm | alert=ON
 ```
 
