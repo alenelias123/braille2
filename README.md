@@ -1,11 +1,20 @@
-# Raspberry Pi 5 USB Camera -> Gemini YES/NO -> Morse on Pins 16 and 13
+# Raspberry Pi 5 Vision + Distance Selector System
 
-This project captures one frame from a USB camera, sends it to Gemini for binary analysis (`YES`/`NO`), converts the result to Morse code, and outputs Morse timing on:
+This project runs continuously and uses two switches:
 
-- Pin 16: LED
-- Pin 13: Motor
+- Switch 1 (`MODE_SWITCH_PIN`, requested pin 12): toggles **Mode 1** ON/OFF
+- Switch 2 (`SELECTOR_SWITCH_PIN`, requested pin 14): cycles selector functions when Mode 1 is ON
 
-By default, these are **physical BOARD pin numbers**.
+Selector functions:
+
+1. Vision function (existing behavior): capture camera frame -> Gemini YES/NO -> Morse on:
+   - LED pin 16
+   - Motor pin 13
+2. Distance function (new behavior): HC-SR04 distance check.  
+   If distance `< 150 cm`, motor pin 13 and LED pin 19 pulse.  
+   Pulse frequency increases as object gets closer.
+
+The program prints switch press events and live status updates in terminal.
 
 ## 1. Install dependencies on Raspberry Pi
 
@@ -15,13 +24,13 @@ sudo apt install -y python3-opencv python3-pip python3-rpi-lgpio python3-lgpio v
 python3 -m pip install -r requirements.txt
 ```
 
-If you previously installed legacy `RPi.GPIO`, remove it to avoid conflicts:
+If legacy `RPi.GPIO` is installed, remove it:
 
 ```bash
 sudo apt remove -y python3-rpi.gpio
 ```
 
-Verify GPIO import in the same interpreter you will run:
+Verify GPIO import:
 
 ```bash
 python3 -c "import RPi.GPIO as GPIO; print(GPIO.VERSION)"
@@ -35,61 +44,62 @@ cp .env.example .env
 
 Edit `.env`:
 
-- Set `GEMINI_API_KEY`
-- Set `DECISION_QUESTION` (this defines what YES/NO means)
-- Keep `PIN_MODE=BOARD` for physical pins, or set `PIN_MODE=BCM` for GPIO numbering
-- For USB camera on Pi, set `CAMERA_DEVICE=/dev/video0` (or `/dev/video1` as needed)
-- Keep `CAMERA_BACKENDS=V4L2,ANY` to prioritize Pi-friendly capture
+- `GEMINI_API_KEY` (required)
+- `DECISION_QUESTION` (defaults to human presence question)
+- Camera settings (`CAMERA_DEVICE=/dev/video0` recommended for USB camera)
+- Pin settings if your wiring differs
 
-## 3. Run
+## 3. Pin mapping notes (important)
+
+With `PIN_MODE=BOARD`:
+
+- Requested `pin 12` is valid GPIO
+- Requested `pin 14` is **GND**, not GPIO
+- Requested `pin 34` is **GND**, not GPIO
+
+Because of that, `.env.example` uses safe GPIO-capable defaults:
+
+- `SELECTOR_SWITCH_PIN=15` (instead of 14)
+- `HCSR04_ECHO_PIN=36` (instead of 34)
+
+If your hardware is wired differently, update `.env` accordingly.
+
+## 4. Run
 
 ```bash
 python3 main.py
 ```
 
-## API Key / Model Check
+Typical runtime logs:
 
-Before full run, validate your key and model access:
+```text
+[10:21:18] Switch 1 (pin 12) pressed -> Mode 1 ENABLED
+[10:21:22] Switch 2 (pin 15) pressed -> Selected Function 1: Vision Human Check
+[10:21:22] Vision result: YES | Morse: -.-- . ...
+[10:21:30] Switch 2 (pin 15) pressed -> Selected Function 2: HC-SR04 Distance Alert
+[10:21:31] Function 2: distance=92.6 cm | threshold=150.0 cm | alert=ON
+```
+
+## 5. API key check
 
 ```bash
-source .env
+GEMINI_API_KEY="$(sed -n 's/^GEMINI_API_KEY=//p' .env | tr -d '\r\n')"
+GEMINI_MODEL="$(sed -n 's/^GEMINI_MODEL=//p' .env | tr -d '\r\n')"
+
 curl -sS "https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent" \
   -H "x-goog-api-key: ${GEMINI_API_KEY}" \
   -H "Content-Type: application/json" \
-  -d '{"contents":[{"parts":[{"text":"Reply YES"}]}]}' | head -c 400
-echo
+  -d '{"contents":[{"parts":[{"text":"Reply YES"}]}]}'
 ```
 
-If this returns an auth error:
-- Regenerate API key in Google AI Studio
-- Ensure `.env` has no quotes/spaces around `GEMINI_API_KEY`
-- Confirm the chosen model is available to your key
-
-Expected terminal output:
-
-```text
-Decision: YES
-Morse: -.-- . ...
-```
-
-`YES` becomes `-.-- . ...` and `NO` becomes `-. ---`.
-
-## Notes
-
-- The script forces Gemini output to one word (`YES` or `NO`) and errors out if ambiguous.
-- GPIO is always cleaned up on exit, including failure cases.
-- If camera capture is enabled (`SAVE_CAPTURE=true`), the frame is saved to `captures/latest.jpg`.
-
-## Camera Troubleshooting
-
-If camera capture fails, identify the correct device first:
+## 6. Camera troubleshooting
 
 ```bash
 ls /dev/video*
 v4l2-ctl --list-devices
 ```
 
-Then set the matching device in `.env`:
+Then set `.env`:
 
 ```env
 CAMERA_DEVICE=/dev/video0
