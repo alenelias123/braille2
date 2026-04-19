@@ -9,6 +9,13 @@ from typing import Dict, List, Optional, Tuple
 import cv2
 import requests
 from dotenv import load_dotenv
+from pin_defaults import (
+    DEFAULT_PIN_LAYOUTS,
+    HEADER_BCM_PINS,
+    LEGACY_PIN_CANDIDATES,
+    NON_GPIO_BOARD_PINS,
+    PIN_FIELDS,
+)
 
 try:
     import RPi.GPIO as GPIO
@@ -121,6 +128,103 @@ def env_bool(name: str, default: bool) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        return int(raw.strip())
+    except ValueError as exc:
+        raise ValueError(f"{name} must be an integer, got {raw!r}.") from exc
+
+
+def load_pin_values(pin_mode: str) -> Dict[str, int]:
+    defaults = DEFAULT_PIN_LAYOUTS[pin_mode]
+    pin_values = {name: env_int(name, defaults[name]) for name in PIN_FIELDS}
+
+    for message in repair_legacy_pin_issues(pin_mode, pin_values):
+        log(message)
+
+    return pin_values
+
+
+def repair_legacy_pin_issues(pin_mode: str, pin_values: Dict[str, int]) -> List[str]:
+    defaults = DEFAULT_PIN_LAYOUTS[pin_mode]
+    legacy_values = LEGACY_PIN_CANDIDATES.get(pin_mode, {})
+    repair_messages: List[str] = []
+
+    while True:
+        issues = find_pin_issues(pin_mode, pin_values)
+        if not issues:
+            break
+
+        repaired = False
+        for fields, _ in issues:
+            for field_name in fields:
+                current_value = pin_values[field_name]
+                default_value = defaults[field_name]
+                if current_value == default_value:
+                    continue
+
+                if current_value not in legacy_values.get(field_name, set()):
+                    continue
+
+                pin_values[field_name] = default_value
+                repair_messages.append(
+                    f"Detected legacy {field_name}={current_value}. "
+                    f"Auto-updating to {default_value} from pin_defaults.py."
+                )
+                repaired = True
+                break
+            if repaired:
+                break
+
+        if not repaired:
+            break
+
+    return repair_messages
+
+
+def find_pin_issues(
+    pin_mode: str, pin_fields: Dict[str, int]
+) -> List[Tuple[Tuple[str, ...], str]]:
+    issues: List[Tuple[Tuple[str, ...], str]] = []
+
+    if pin_mode == "BOARD":
+        for name, pin in pin_fields.items():
+            if pin in NON_GPIO_BOARD_PINS:
+                issues.append(
+                    (
+                        (name,),
+                        f"{name}={pin} is power/GND in BOARD mode and cannot be used as GPIO.",
+                    )
+                )
+    else:
+        for name, pin in pin_fields.items():
+            if pin not in HEADER_BCM_PINS:
+                issues.append(
+                    (
+                        (name,),
+                        f"{name}={pin} is not exposed on the 40-pin header in BCM mode.",
+                    )
+                )
+
+    seen: Dict[int, str] = {}
+    for name in PIN_FIELDS:
+        pin = pin_fields[name]
+        if pin in seen:
+            issues.append(
+                (
+                    (seen[pin], name),
+                    f"{name} reuses pin {pin}, already assigned to {seen[pin]}.",
+                )
+            )
+        else:
+            seen[pin] = name
+
+    return issues
+
+
 def load_config() -> AppConfig:
     load_dotenv()
 
@@ -135,6 +239,8 @@ def load_config() -> AppConfig:
     pin_mode = os.getenv("PIN_MODE", "BOARD").strip().upper()
     if pin_mode not in {"BOARD", "BCM"}:
         raise ValueError("PIN_MODE must be BOARD or BCM.")
+
+    pin_values = load_pin_values(pin_mode)
 
     config = AppConfig(
         api_key=api_key,
@@ -157,13 +263,13 @@ def load_config() -> AppConfig:
         save_capture=env_bool("SAVE_CAPTURE", True),
         capture_path=Path(os.getenv("CAPTURE_PATH", "captures/latest.jpg")),
         pin_mode=pin_mode,
-        led_pin=int(os.getenv("LED_PIN", "11")),
-        motor_pin=int(os.getenv("MOTOR_PIN", "36")),
-        aux_led_pin=int(os.getenv("AUX_LED_PIN", "13")),
-        mode_switch_pin=int(os.getenv("MODE_SWITCH_PIN", "29")),
-        selector_switch_pin=int(os.getenv("SELECTOR_SWITCH_PIN", "31")),
-        hcsr04_trigger_pin=int(os.getenv("HCSR04_TRIGGER_PIN", "16")),
-        hcsr04_echo_pin=int(os.getenv("HCSR04_ECHO_PIN", "18")),
+        led_pin=pin_values["LED_PIN"],
+        motor_pin=pin_values["MOTOR_PIN"],
+        aux_led_pin=pin_values["AUX_LED_PIN"],
+        mode_switch_pin=pin_values["MODE_SWITCH_PIN"],
+        selector_switch_pin=pin_values["SELECTOR_SWITCH_PIN"],
+        hcsr04_trigger_pin=pin_values["HCSR04_TRIGGER_PIN"],
+        hcsr04_echo_pin=pin_values["HCSR04_ECHO_PIN"],
         switch_active_low=env_bool("SWITCH_ACTIVE_LOW", True),
         switch_debounce_seconds=float(os.getenv("SWITCH_DEBOUNCE_SECONDS", "0.25")),
         dot_seconds=float(os.getenv("DOT_SECONDS", "0.2")),
@@ -199,56 +305,16 @@ def validate_pin_config(config: AppConfig) -> None:
         "HCSR04_TRIGGER_PIN": config.hcsr04_trigger_pin,
         "HCSR04_ECHO_PIN": config.hcsr04_echo_pin,
     }
-
-    if config.pin_mode == "BOARD":
-        non_gpio_pins = {1, 2, 4, 6, 9, 14, 17, 20, 25, 30, 34, 39}
-        for name, pin in pin_fields.items():
-            if pin in non_gpio_pins:
-                raise ValueError(
-                    f"{name}={pin} is power/GND in BOARD mode and cannot be used as GPIO."
-                )
-    else:
-        header_bcm_pins = {
-            0,
-            1,
-            2,
-            3,
-            4,
-            5,
-            6,
-            7,
-            8,
-            9,
-            10,
-            11,
-            12,
-            13,
-            14,
-            15,
-            16,
-            17,
-            18,
-            19,
-            20,
-            21,
-            22,
-            23,
-            24,
-            25,
-            26,
-            27,
-        }
-        for name, pin in pin_fields.items():
-            if pin not in header_bcm_pins:
-                raise ValueError(
-                    f"{name}={pin} is not exposed on the 40-pin header in BCM mode."
-                )
-
-    seen: Dict[int, str] = {}
-    for name, pin in pin_fields.items():
-        if pin in seen:
-            raise ValueError(f"{name} reuses pin {pin}, already assigned to {seen[pin]}.")
-        seen[pin] = name
+    issues = find_pin_issues(config.pin_mode, pin_fields)
+    if issues:
+        issue_lines = "\n".join(f"- {message}" for _, message in issues)
+        current_map = ", ".join(f"{name}={pin_fields[name]}" for name in PIN_FIELDS)
+        raise ValueError(
+            "Invalid pin configuration:\n"
+            f"{issue_lines}\n"
+            f"Resolved pins: {current_map}\n"
+            "Update your .env overrides or the defaults in pin_defaults.py."
+        )
 
     if config.distance_threshold_cm <= 0:
         raise ValueError("DISTANCE_THRESHOLD_CM must be > 0.")

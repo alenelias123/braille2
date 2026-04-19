@@ -54,6 +54,9 @@ Edit `.env`:
 - Camera settings (`CAMERA_DEVICE=/dev/video0` recommended for USB camera)
 - Pin settings if your wiring differs
 
+The canonical pin map now lives in [pin_defaults.py](/d:/apps/braille2/pin_defaults.py:1).  
+`.env` pin values are treated as overrides on top of that file, which helps the app recover from stale pin values left over from earlier wiring revisions.
+
 ## 3. Pin mapping
 
 With `PIN_MODE=BOARD`:
@@ -67,7 +70,7 @@ With `PIN_MODE=BOARD`:
 - HC-SR04 echo: `HCSR04_ECHO_PIN=18`
 - HC-SR04 VCC: physical pin `2` (5V)
 
-These are the defaults in `.env.example`. If your hardware is wired differently, update `.env` accordingly.
+These are the defaults in `.env.example` and `pin_defaults.py`. If your hardware is wired differently, update `.env` accordingly.
 
 ## 4. Run
 
