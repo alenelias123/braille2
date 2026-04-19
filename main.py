@@ -73,15 +73,20 @@ class AppConfig:
     model: str
     decision_question: str
     room_description_prompt: str
+    asl_translation_prompt: str
     camera_index: int
     camera_device: str
     camera_backends: str
     frame_width: int
     frame_height: int
+    video_frame_width: int
+    video_frame_height: int
     camera_warmup_frames: int
     camera_read_attempts: int
+    video_fps: float
     save_capture: bool
     capture_path: Path
+    video_capture_path: Path
     pin_mode: str
     led_pin: int
     motor_pin: int
@@ -92,6 +97,7 @@ class AppConfig:
     hcsr04_echo_pin: int
     switch_active_low: bool
     switch_debounce_seconds: float
+    mode_switch_long_press_seconds: float
     selector_medium_press_seconds: float
     selector_long_press_seconds: float
     dot_seconds: float
@@ -128,6 +134,10 @@ class PulseState:
 def log(message: str) -> None:
     ts = time.strftime("%H:%M:%S")
     print(f"[{ts}] {message}", flush=True)
+
+
+ENVIRONMENT_ASSISTANCE_MODE = "Environment Assistance Mode"
+ASL_SIGN_TRANSLATION_MODE = "ASL Sign Translation Mode"
 
 
 def env_bool(name: str, default: bool) -> bool:
@@ -262,15 +272,26 @@ def load_config() -> AppConfig:
                 "such that Morse code is enough for the user to understand the scene."
             ),
         ).strip(),
+        asl_translation_prompt=os.getenv(
+            "ASL_TRANSLATION_PROMPT",
+            (
+                "Watch the full ASL signing in the video and convert it to the "
+                "shortest correct English phrase possible for later Braille output."
+            ),
+        ).strip(),
         camera_index=int(os.getenv("CAMERA_INDEX", "0")),
         camera_device=os.getenv("CAMERA_DEVICE", "").strip(),
         camera_backends=os.getenv("CAMERA_BACKENDS", "V4L2,ANY").strip(),
         frame_width=int(os.getenv("FRAME_WIDTH", "1280")),
         frame_height=int(os.getenv("FRAME_HEIGHT", "720")),
+        video_frame_width=int(os.getenv("VIDEO_FRAME_WIDTH", "640")),
+        video_frame_height=int(os.getenv("VIDEO_FRAME_HEIGHT", "480")),
         camera_warmup_frames=int(os.getenv("CAMERA_WARMUP_FRAMES", "8")),
         camera_read_attempts=int(os.getenv("CAMERA_READ_ATTEMPTS", "20")),
+        video_fps=float(os.getenv("VIDEO_FPS", "10.0")),
         save_capture=env_bool("SAVE_CAPTURE", True),
         capture_path=Path(os.getenv("CAPTURE_PATH", "captures/latest.jpg")),
+        video_capture_path=Path(os.getenv("VIDEO_CAPTURE_PATH", "captures/latest_asl.mp4")),
         pin_mode=pin_mode,
         led_pin=pin_values["LED_PIN"],
         motor_pin=pin_values["MOTOR_PIN"],
@@ -281,6 +302,9 @@ def load_config() -> AppConfig:
         hcsr04_echo_pin=pin_values["HCSR04_ECHO_PIN"],
         switch_active_low=env_bool("SWITCH_ACTIVE_LOW", True),
         switch_debounce_seconds=float(os.getenv("SWITCH_DEBOUNCE_SECONDS", "0.25")),
+        mode_switch_long_press_seconds=float(
+            os.getenv("MODE_SWITCH_LONG_PRESS_SECONDS", "2.5")
+        ),
         selector_medium_press_seconds=float(
             os.getenv("SELECTOR_MEDIUM_PRESS_SECONDS", "2.0")
         ),
@@ -337,6 +361,15 @@ def validate_pin_config(config: AppConfig) -> None:
     if config.distance_min_period_seconds > config.distance_max_period_seconds:
         raise ValueError(
             "DISTANCE_MIN_PERIOD_SECONDS must be <= DISTANCE_MAX_PERIOD_SECONDS."
+        )
+    if config.video_frame_width <= 0 or config.video_frame_height <= 0:
+        raise ValueError("VIDEO_FRAME_WIDTH and VIDEO_FRAME_HEIGHT must be > 0.")
+    if config.video_fps <= 0:
+        raise ValueError("VIDEO_FPS must be > 0.")
+    if config.mode_switch_long_press_seconds <= config.switch_debounce_seconds:
+        raise ValueError(
+            "MODE_SWITCH_LONG_PRESS_SECONDS must be greater than "
+            "SWITCH_DEBOUNCE_SECONDS."
         )
     if config.selector_medium_press_seconds <= config.switch_debounce_seconds:
         raise ValueError(
@@ -435,6 +468,84 @@ def capture_frame(config: AppConfig) -> bytes:
         return jpg_bytes
     finally:
         cap.release()
+
+
+def capture_video_until_short_selector_press(config: AppConfig) -> bytes:
+    cap, backend_name, source_label = open_camera(config)
+    writer: Optional[cv2.VideoWriter] = None
+    stop_button = ButtonState(
+        prev_pressed=is_switch_pressed(config, config.selector_switch_pin)
+    )
+    video_path = config.video_capture_path
+    frame_count = 0
+
+    try:
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, config.video_frame_width)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, config.video_frame_height)
+
+        for _ in range(config.camera_warmup_frames):
+            cap.read()
+            time.sleep(0.05)
+
+        log(
+            "ASL Sign Translation active. Recording video now. "
+            "Short press Switch 2 to stop recording and start translation."
+        )
+
+        while True:
+            ok, frame = cap.read()
+            if not ok or frame is None:
+                raise RuntimeError(
+                    "Video frame capture failed. "
+                    f"Source={source_label}, backend={backend_name}. "
+                    "Check camera with: ls /dev/video* and v4l2-ctl --list-devices."
+                )
+
+            if writer is None:
+                height, width = frame.shape[:2]
+                video_path.parent.mkdir(parents=True, exist_ok=True)
+                writer = cv2.VideoWriter(
+                    str(video_path),
+                    cv2.VideoWriter_fourcc(*"mp4v"),
+                    config.video_fps,
+                    (width, height),
+                )
+                if not writer.isOpened():
+                    raise RuntimeError(
+                        f"Failed to open video writer for {video_path}."
+                    )
+
+            writer.write(frame)
+            frame_count += 1
+
+            now = time.monotonic()
+            selector_pressed = is_switch_pressed(config, config.selector_switch_pin)
+            selector_event = read_button_event(
+                stop_button, selector_pressed, now, config.switch_debounce_seconds
+            )
+            if selector_event.released:
+                if selector_event.press_duration < config.selector_medium_press_seconds:
+                    log(
+                        f"Switch 2 (pin {config.selector_switch_pin}) released after "
+                        f"{selector_event.press_duration:.2f}s -> stopping ASL video capture"
+                    )
+                    break
+                log(
+                    f"Switch 2 release of {selector_event.press_duration:.2f}s ignored "
+                    "while recording. Use a short press to stop the video."
+                )
+
+            time.sleep(max(0.0, (1.0 / config.video_fps) * 0.25))
+
+        if frame_count == 0:
+            raise RuntimeError("No video frames were captured for ASL translation.")
+
+    finally:
+        if writer is not None:
+            writer.release()
+        cap.release()
+
+    return video_path.read_bytes()
 
 
 def request_gemini(config: AppConfig, url: str, payload: dict) -> dict:
@@ -575,6 +686,59 @@ def ask_gemini_room_summary(config: AppConfig, image_bytes: bytes) -> str:
     if not text:
         raise ValueError(
             "Gemini returned no room description text. "
+            f"finishReason={first_finish_reason(data)!r}, response={data}"
+        )
+    return normalize_morse_text(text)
+
+
+def ask_gemini_asl_translation(config: AppConfig, video_bytes: bytes) -> str:
+    url = f"{GEMINI_API_BASE}/{config.model}:generateContent"
+    video_b64 = base64.b64encode(video_bytes).decode("utf-8")
+    prompt = (
+        f"{config.asl_translation_prompt}\n"
+        "Rules:\n"
+        "- Watch the full video before deciding the answer.\n"
+        "- Output only uppercase English words separated by single spaces.\n"
+        "- Use only letters A-Z, digits 0-9, and spaces.\n"
+        "- No punctuation, bullets, or explanations.\n"
+        "- Autocorrect likely finger-spelling or signing mistakes into the intended English phrase.\n"
+        "- Keep the result as short as possible while preserving the intended meaning.\n"
+        "- Prefer a compact everyday English phrase that would be easy to convert to Braille.\n"
+        "- If the signer spells a name or word letter by letter, return the corrected final word.\n"
+        "- If the meaning is unclear, output UNKNOWN.\n"
+        "Examples of valid outputs:\n"
+        "HELLO\n"
+        "I NEED WATER\n"
+        "OPEN DOOR\n"
+        "MY NAME ALEN"
+    )
+
+    payload = {
+        "contents": [
+            {
+                "parts": [
+                    {"text": prompt},
+                    {
+                        "inline_data": {
+                            "mime_type": "video/mp4",
+                            "data": video_b64,
+                        }
+                    },
+                ]
+            }
+        ],
+        "generationConfig": {
+            "temperature": 0.2,
+            "maxOutputTokens": 64,
+            "responseMimeType": "text/plain",
+        },
+    }
+
+    data = request_gemini(config, url, payload)
+    text = extract_text(data)
+    if not text:
+        raise ValueError(
+            "Gemini returned no ASL translation text. "
             f"finishReason={first_finish_reason(data)!r}, response={data}"
         )
     return normalize_morse_text(text)
@@ -738,11 +902,11 @@ def selector_press_label(config: AppConfig, selector_index: int) -> str:
 
 def log_selector_menu(config: AppConfig) -> None:
     log(
-        "Switch 2 selection menu: "
-        f"long press -> Function 1, "
+        f"{ENVIRONMENT_ASSISTANCE_MODE} menu: "
+        f"long press -> Human Presence Check, "
         f"medium press ({config.selector_medium_press_seconds:.1f}s-"
-        f"{config.selector_long_press_seconds:.1f}s) -> Function 2, "
-        f"short press -> Function 3."
+        f"{config.selector_long_press_seconds:.1f}s) -> Distance Navigation Alert, "
+        f"short press -> Room Summary To Morse."
     )
 
 
@@ -810,7 +974,7 @@ def run_vision_check(config: AppConfig) -> Tuple[str, str]:
     image = capture_frame(config)
     decision = ask_gemini_yes_no(config, image)
     morse = text_to_morse(decision)
-    log(f"Vision result: {decision} | Morse: {morse}")
+    log(f"Human Presence Check result: {decision} | Morse: {morse}")
     return decision, morse
 
 
@@ -820,6 +984,13 @@ def run_room_description_check(config: AppConfig) -> Tuple[str, str]:
     morse = text_to_morse(summary)
     log(f"Room summary: {summary} | Morse: {morse}")
     return summary, morse
+
+
+def run_asl_translation(config: AppConfig) -> str:
+    video = capture_video_until_short_selector_press(config)
+    translation = ask_gemini_asl_translation(config, video)
+    log(f"ASL translation: {translation}")
+    return translation
 
 
 def main() -> None:
@@ -833,12 +1004,12 @@ def main() -> None:
         prev_pressed=is_switch_pressed(config, config.selector_switch_pin)
     )
 
-    mode1_enabled = False
+    environment_assistance_enabled = False
     selector_index: Optional[int] = None
     selector_labels = [
-        "Function 1: Vision Human Check",
-        "Function 2: HC-SR04 Distance Alert",
-        "Function 3: Room Summary To Morse",
+        "Human Presence Check",
+        "Distance Navigation Alert",
+        "Room Summary To Morse",
     ]
     pulse_state = PulseState()
     last_decision: Optional[str] = None
@@ -849,10 +1020,13 @@ def main() -> None:
 
     log("System ready.")
     log(
-        f"Switch 1 pin {config.mode_switch_pin}: Mode 1 toggle | "
-        f"Switch 2 pin {config.selector_switch_pin}: press-duration selector"
+        f"Switch 1 pin {config.mode_switch_pin}: short press toggles {ENVIRONMENT_ASSISTANCE_MODE} | "
+        f"long press ({config.mode_switch_long_press_seconds:.1f}s+) starts {ASL_SIGN_TRANSLATION_MODE}"
     )
-    log_selector_menu(config)
+    log(
+        f"Switch 2 pin {config.selector_switch_pin}: stops ASL recording with a short press, "
+        f"or selects a function inside {ENVIRONMENT_ASSISTANCE_MODE} by press duration."
+    )
 
     try:
         while True:
@@ -866,33 +1040,53 @@ def main() -> None:
                 selector_button, selector_pressed, now, config.switch_debounce_seconds
             )
 
-            if mode_event.pressed:
-                mode1_enabled = not mode1_enabled
-                state_text = "ENABLED" if mode1_enabled else "DISABLED"
-                log(
-                    f"Switch 1 (pin {config.mode_switch_pin}) pressed -> Mode 1 {state_text}"
-                )
+            if mode_event.released:
                 clear_all_outputs(config)
                 pulse_state = PulseState()
                 selector_index = None
                 last_distance_cm = None
                 last_distance_read_at = 0.0
                 last_distance_log_at = 0.0
-                if mode1_enabled:
-                    log("Mode 1 active.")
+
+                if mode_event.press_duration >= config.mode_switch_long_press_seconds:
+                    environment_assistance_enabled = False
+                    log(
+                        f"Switch 1 (pin {config.mode_switch_pin}) released after "
+                        f"{mode_event.press_duration:.2f}s -> {ASL_SIGN_TRANSLATION_MODE}"
+                    )
+                    try:
+                        log(
+                            f"Running {ASL_SIGN_TRANSLATION_MODE}: record video until a short "
+                            "Switch 2 press, then send it to Gemini."
+                        )
+                        run_asl_translation(config)
+                    except Exception as exc:
+                        log(f"{ASL_SIGN_TRANSLATION_MODE} error: {exc}")
+                    finally:
+                        clear_all_outputs(config)
+                    continue
+
+                environment_assistance_enabled = not environment_assistance_enabled
+                state_text = "ENABLED" if environment_assistance_enabled else "DISABLED"
+                log(
+                    f"Switch 1 (pin {config.mode_switch_pin}) released after "
+                    f"{mode_event.press_duration:.2f}s -> {ENVIRONMENT_ASSISTANCE_MODE} {state_text}"
+                )
+                if environment_assistance_enabled:
                     log_selector_menu(config)
                 continue
 
             if selector_event.released:
-                if not mode1_enabled:
+                if not environment_assistance_enabled:
                     log(
                         f"Switch 2 (pin {config.selector_switch_pin}) released after "
-                        f"{selector_event.press_duration:.2f}s -> ignored (Mode 1 is disabled)"
+                        f"{selector_event.press_duration:.2f}s -> ignored "
+                        f"({ENVIRONMENT_ASSISTANCE_MODE} is disabled)"
                     )
                 elif selector_index == 1:
                     log(
                         f"Switch 2 (pin {config.selector_switch_pin}) released after "
-                        f"{selector_event.press_duration:.2f}s -> exiting navigation mode"
+                        f"{selector_event.press_duration:.2f}s -> exiting Distance Navigation Alert"
                     )
                     clear_all_outputs(config)
                     pulse_state = PulseState()
@@ -919,14 +1113,14 @@ def main() -> None:
                         last_distance_read_at = 0.0
                         last_distance_log_at = 0.0
                         log(
-                            "Function 2 active: navigation mode running. "
-                            "Click Switch 2 to exit navigation mode."
+                            "Distance Navigation Alert active. "
+                            "Click Switch 2 to exit this mode."
                         )
                     else:
                         try:
                             if selector_index == 0:
                                 log(
-                                    "Running Function 1: capture + Gemini human-presence check"
+                                    "Running Human Presence Check: capture + Gemini"
                                 )
                                 decision, morse = run_vision_check(config)
                                 if (
@@ -940,7 +1134,7 @@ def main() -> None:
                                     signal_morse(config, morse)
                                 last_decision = decision
                             else:
-                                log("Running Function 3: capture + Gemini room summary")
+                                log("Running Room Summary To Morse: capture + Gemini")
                                 summary, morse = run_room_description_check(config)
                                 if (
                                     summary == last_room_summary
@@ -953,14 +1147,14 @@ def main() -> None:
                                     signal_morse(config, morse)
                                 last_room_summary = summary
                         except Exception as exc:
-                            log(f"Function {selector_index + 1} error: {exc}")
+                            log(f"{selector_labels[selector_index]} error: {exc}")
                         finally:
                             clear_all_outputs(config)
                             selector_index = None
                             log_selector_menu(config)
                         continue
 
-            if not mode1_enabled or selector_index is None:
+            if not environment_assistance_enabled or selector_index is None:
                 time.sleep(config.main_loop_sleep_seconds)
                 continue
 
@@ -973,11 +1167,11 @@ def main() -> None:
 
                 if now - last_distance_log_at >= config.distance_log_interval_seconds:
                     if last_distance_cm is None:
-                        log("Function 2: distance read timeout. Check HC-SR04 wiring.")
+                        log("Distance Navigation Alert: read timeout. Check HC-SR04 wiring.")
                     else:
                         alert_on = last_distance_cm < config.distance_threshold_cm
                         log(
-                            f"Function 2: distance={last_distance_cm:.1f} cm | "
+                            f"Distance Navigation Alert: distance={last_distance_cm:.1f} cm | "
                             f"threshold={config.distance_threshold_cm:.1f} cm | "
                             f"alert={'ON' if alert_on else 'OFF'}"
                         )
