@@ -3,20 +3,26 @@
 This project runs continuously and uses two switches:
 
 - Switch 1 (`MODE_SWITCH_PIN`, pin 29): toggles **Mode 1** ON/OFF
-- Switch 2 (`SELECTOR_SWITCH_PIN`, pin 31): cycles selector functions when Mode 1 is ON
+- Switch 2 (`SELECTOR_SWITCH_PIN`, pin 31): selects a function by press duration when Mode 1 is ON
 
 Selector functions:
 
-1. Vision function (existing behavior): capture camera frame -> Gemini YES/NO -> Morse on:
+1. Vision function: long press Switch 2 for 3+ seconds.  
+   Capture one camera frame -> Gemini YES/NO -> Morse on:
    - LED pin 11
    - Motor pin 36
-2. Distance function (new behavior): HC-SR04 distance check.  
+   After playback, the system returns to the selection menu.
+2. Distance function: hold Switch 2 for about 2-3 seconds.  
+   HC-SR04 distance check starts and stays active as a navigation mode.  
    If distance `< 150 cm`, motor pin 36 and LED pin 13 pulse.  
-   Pulse frequency increases as object gets closer.
-3. Room summary function: capture a USB camera frame -> Gemini returns a minimal room summary -> summary is converted to Morse on:
+   Pulse frequency increases as object gets closer.  
+   Press Switch 2 again to exit navigation mode.
+3. Room summary function: short press Switch 2.  
+   Capture a USB camera frame -> Gemini returns a minimal room summary -> summary is converted to Morse on:
    - LED pin 11
    - Motor pin 36
-   The Gemini prompt is constrained to produce a short Morse-safe uppercase description such as `BED CHAIR TABLE`.
+   The Gemini prompt is constrained to produce a short Morse-safe uppercase description such as `PERSON DOOR TABLE`.  
+   After playback, the system returns to the selection menu.
 
 The program prints switch press events and live status updates in terminal.
 
@@ -51,6 +57,7 @@ Edit `.env`:
 - `GEMINI_API_KEY` (required)
 - `DECISION_QUESTION` (defaults to human presence question)
 - `ROOM_DESCRIPTION_PROMPT` (defaults to a minimal room-summary prompt for Morse output)
+- `SELECTOR_MEDIUM_PRESS_SECONDS` and `SELECTOR_LONG_PRESS_SECONDS` if you want different Switch 2 timing thresholds
 - Camera settings (`CAMERA_DEVICE=/dev/video0` recommended for USB camera)
 - Pin settings if your wiring differs
 
@@ -82,12 +89,15 @@ Typical runtime logs:
 
 ```text
 [10:21:18] Switch 1 (pin 29) pressed -> Mode 1 ENABLED
-[10:21:22] Switch 2 (pin 31) pressed -> Selected Function 1: Vision Human Check
+[10:21:18] Switch 2 selection menu: long press -> Function 1, medium press (2.0s-3.0s) -> Function 2, short press -> Function 3.
+[10:21:22] Switch 2 (pin 31) released after 3.40s -> Selected Function 1: Vision Human Check via long press (3.0s+)
 [10:21:22] Vision result: YES | Morse: -.-- . ...
-[10:21:30] Switch 2 (pin 31) pressed -> Selected Function 2: HC-SR04 Distance Alert
+[10:21:30] Switch 2 (pin 31) released after 2.40s -> Selected Function 2: HC-SR04 Distance Alert via medium press (2.0s-3.0s)
+[10:21:30] Function 2 active: navigation mode running. Click Switch 2 to exit navigation mode.
 [10:21:31] Function 2: distance=92.6 cm | threshold=150.0 cm | alert=ON
-[10:21:38] Switch 2 (pin 31) pressed -> Selected Function 3: Room Summary To Morse
-[10:21:39] Room summary: BED CHAIR TABLE | Morse: -... . -.. / -.-. .... .- .. .-. / - .- -... .-.. .
+[10:21:34] Switch 2 (pin 31) released after 0.18s -> exiting navigation mode
+[10:21:38] Switch 2 (pin 31) released after 0.30s -> Selected Function 3: Room Summary To Morse via short press (<2.0s)
+[10:21:39] Room summary: PERSON DOOR TABLE | Morse: .--. . .-. ... --- -. / -.. --- --- .-. / - .- -... .-.. .
 ```
 
 ## 5. API key check

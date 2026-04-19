@@ -92,8 +92,9 @@ class AppConfig:
     hcsr04_echo_pin: int
     switch_active_low: bool
     switch_debounce_seconds: float
+    selector_medium_press_seconds: float
+    selector_long_press_seconds: float
     dot_seconds: float
-    vision_interval_seconds: float
     repeat_same_morse: bool
     hcsr04_timeout_seconds: float
     distance_threshold_cm: float
@@ -108,6 +109,14 @@ class AppConfig:
 class ButtonState:
     prev_pressed: bool = False
     last_event_at: float = 0.0
+    press_started_at: float = 0.0
+
+
+@dataclass
+class ButtonEvent:
+    pressed: bool = False
+    released: bool = False
+    press_duration: float = 0.0
 
 
 @dataclass
@@ -272,8 +281,13 @@ def load_config() -> AppConfig:
         hcsr04_echo_pin=pin_values["HCSR04_ECHO_PIN"],
         switch_active_low=env_bool("SWITCH_ACTIVE_LOW", True),
         switch_debounce_seconds=float(os.getenv("SWITCH_DEBOUNCE_SECONDS", "0.25")),
+        selector_medium_press_seconds=float(
+            os.getenv("SELECTOR_MEDIUM_PRESS_SECONDS", "2.0")
+        ),
+        selector_long_press_seconds=float(
+            os.getenv("SELECTOR_LONG_PRESS_SECONDS", "3.0")
+        ),
         dot_seconds=float(os.getenv("DOT_SECONDS", "0.2")),
-        vision_interval_seconds=float(os.getenv("VISION_INTERVAL_SECONDS", "5.0")),
         repeat_same_morse=env_bool("REPEAT_SAME_MORSE", True),
         hcsr04_timeout_seconds=float(os.getenv("HCSR04_TIMEOUT_SECONDS", "0.03")),
         distance_threshold_cm=float(os.getenv("DISTANCE_THRESHOLD_CM", "150")),
@@ -323,6 +337,15 @@ def validate_pin_config(config: AppConfig) -> None:
     if config.distance_min_period_seconds > config.distance_max_period_seconds:
         raise ValueError(
             "DISTANCE_MIN_PERIOD_SECONDS must be <= DISTANCE_MAX_PERIOD_SECONDS."
+        )
+    if config.selector_medium_press_seconds <= config.switch_debounce_seconds:
+        raise ValueError(
+            "SELECTOR_MEDIUM_PRESS_SECONDS must be greater than SWITCH_DEBOUNCE_SECONDS."
+        )
+    if config.selector_long_press_seconds <= config.selector_medium_press_seconds:
+        raise ValueError(
+            "SELECTOR_LONG_PRESS_SECONDS must be greater than "
+            "SELECTOR_MEDIUM_PRESS_SECONDS."
         )
 
 
@@ -513,9 +536,12 @@ def ask_gemini_room_summary(config: AppConfig, image_bytes: bytes) -> str:
         "- Output only uppercase words separated by single spaces.\n"
         "- Use only letters A-Z, digits 0-9, and spaces.\n"
         "- No punctuation, bullets, or full sentences.\n"
-        "- Keep it extremely short: 2 to 6 words.\n"
-        "- Mention only the most important visible items, people, or furniture.\n"
-        "- Prefer concrete nouns over adjectives.\n"
+        "- Keep it extremely short: 2 to 5 words.\n"
+        "- Mention only the most important visible objects, furniture, people, or obstacles.\n"
+        "- Prefer concrete nouns over adjectives and abstract words.\n"
+        "- Order words by usefulness to a blind user entering the room.\n"
+        "- Prefer navigationally important items first, such as PERSON, DOOR, TABLE, CHAIR, BED, STAIRS, BAG.\n"
+        "- Skip colors, textures, and unimportant decoration.\n"
         "- If the scene is unclear, output UNKNOWN.\n"
         "Examples of valid outputs:\n"
         "BED CHAIR TABLE\n"
@@ -668,18 +694,56 @@ def is_switch_pressed(config: AppConfig, pin: int) -> bool:
     return level == GPIO.LOW if config.switch_active_low else level == GPIO.HIGH
 
 
-def check_pressed_event(
+def read_button_event(
     button_state: ButtonState, current_pressed: bool, now: float, debounce_seconds: float
-) -> bool:
-    pressed_event = (
-        current_pressed
-        and not button_state.prev_pressed
-        and (now - button_state.last_event_at) >= debounce_seconds
-    )
+) -> ButtonEvent:
+    if current_pressed == button_state.prev_pressed:
+        return ButtonEvent()
+    if (now - button_state.last_event_at) < debounce_seconds:
+        return ButtonEvent()
+
+    button_state.last_event_at = now
     button_state.prev_pressed = current_pressed
-    if pressed_event:
-        button_state.last_event_at = now
-    return pressed_event
+
+    if current_pressed:
+        button_state.press_started_at = now
+        return ButtonEvent(pressed=True)
+
+    duration = 0.0
+    if button_state.press_started_at:
+        duration = max(0.0, now - button_state.press_started_at)
+    button_state.press_started_at = 0.0
+    return ButtonEvent(released=True, press_duration=duration)
+
+
+def classify_selector_press(config: AppConfig, press_duration: float) -> int:
+    if press_duration >= config.selector_long_press_seconds:
+        return 0
+    if press_duration >= config.selector_medium_press_seconds:
+        return 1
+    return 2
+
+
+def selector_press_label(config: AppConfig, selector_index: int) -> str:
+    if selector_index == 0:
+        return f"long press ({config.selector_long_press_seconds:.1f}s+)"
+    if selector_index == 1:
+        return (
+            "medium press "
+            f"({config.selector_medium_press_seconds:.1f}s-"
+            f"{config.selector_long_press_seconds:.1f}s)"
+        )
+    return f"short press (<{config.selector_medium_press_seconds:.1f}s)"
+
+
+def log_selector_menu(config: AppConfig) -> None:
+    log(
+        "Switch 2 selection menu: "
+        f"long press -> Function 1, "
+        f"medium press ({config.selector_medium_press_seconds:.1f}s-"
+        f"{config.selector_long_press_seconds:.1f}s) -> Function 2, "
+        f"short press -> Function 3."
+    )
 
 
 def measure_distance_cm(config: AppConfig) -> Optional[float]:
@@ -777,29 +841,32 @@ def main() -> None:
         "Function 3: Room Summary To Morse",
     ]
     pulse_state = PulseState()
-    last_vision_at = 0.0
     last_decision: Optional[str] = None
     last_distance_read_at = 0.0
     last_distance_log_at = 0.0
     last_distance_cm: Optional[float] = None
-    last_room_summary_at = 0.0
     last_room_summary: Optional[str] = None
 
     log("System ready.")
     log(
         f"Switch 1 pin {config.mode_switch_pin}: Mode 1 toggle | "
-        f"Switch 2 pin {config.selector_switch_pin}: selector cycle"
+        f"Switch 2 pin {config.selector_switch_pin}: press-duration selector"
     )
+    log_selector_menu(config)
 
     try:
         while True:
             now = time.monotonic()
             mode_pressed = is_switch_pressed(config, config.mode_switch_pin)
             selector_pressed = is_switch_pressed(config, config.selector_switch_pin)
-
-            if check_pressed_event(
+            mode_event = read_button_event(
                 mode_button, mode_pressed, now, config.switch_debounce_seconds
-            ):
+            )
+            selector_event = read_button_event(
+                selector_button, selector_pressed, now, config.switch_debounce_seconds
+            )
+
+            if mode_event.pressed:
                 mode1_enabled = not mode1_enabled
                 state_text = "ENABLED" if mode1_enabled else "DISABLED"
                 log(
@@ -807,67 +874,97 @@ def main() -> None:
                 )
                 clear_all_outputs(config)
                 pulse_state = PulseState()
+                selector_index = None
                 last_distance_cm = None
                 last_distance_read_at = 0.0
                 last_distance_log_at = 0.0
-                last_room_summary_at = 0.0
                 if mode1_enabled:
-                    selector_index = None
-                    log("Mode 1 active. Press Switch 2 to select function.")
-                else:
-                    selector_index = None
+                    log("Mode 1 active.")
+                    log_selector_menu(config)
+                continue
 
-            if check_pressed_event(
-                selector_button, selector_pressed, now, config.switch_debounce_seconds
-            ):
+            if selector_event.released:
                 if not mode1_enabled:
                     log(
-                        f"Switch 2 (pin {config.selector_switch_pin}) pressed -> ignored (Mode 1 is disabled)"
+                        f"Switch 2 (pin {config.selector_switch_pin}) released after "
+                        f"{selector_event.press_duration:.2f}s -> ignored (Mode 1 is disabled)"
                     )
-                else:
-                    if selector_index is None:
-                        selector_index = 0
-                    else:
-                        selector_index = (selector_index + 1) % len(selector_labels)
+                elif selector_index == 1:
                     log(
-                        f"Switch 2 (pin {config.selector_switch_pin}) pressed -> "
-                        f"Selected {selector_labels[selector_index]}"
+                        f"Switch 2 (pin {config.selector_switch_pin}) released after "
+                        f"{selector_event.press_duration:.2f}s -> exiting navigation mode"
                     )
                     clear_all_outputs(config)
                     pulse_state = PulseState()
-                    if selector_index == 0:
-                        last_vision_at = 0.0
-                    elif selector_index == 1:
+                    selector_index = None
+                    last_distance_cm = None
+                    last_distance_read_at = 0.0
+                    last_distance_log_at = 0.0
+                    log_selector_menu(config)
+                    continue
+                else:
+                    selector_index = classify_selector_press(
+                        config, selector_event.press_duration
+                    )
+                    log(
+                        f"Switch 2 (pin {config.selector_switch_pin}) released after "
+                        f"{selector_event.press_duration:.2f}s -> "
+                        f"Selected {selector_labels[selector_index]} via "
+                        f"{selector_press_label(config, selector_index)}"
+                    )
+                    clear_all_outputs(config)
+                    pulse_state = PulseState()
+                    if selector_index == 1:
                         last_distance_cm = None
                         last_distance_read_at = 0.0
                         last_distance_log_at = 0.0
+                        log(
+                            "Function 2 active: navigation mode running. "
+                            "Click Switch 2 to exit navigation mode."
+                        )
                     else:
-                        last_room_summary_at = 0.0
+                        try:
+                            if selector_index == 0:
+                                log(
+                                    "Running Function 1: capture + Gemini human-presence check"
+                                )
+                                decision, morse = run_vision_check(config)
+                                if (
+                                    decision == last_decision
+                                    and not config.repeat_same_morse
+                                ):
+                                    log(
+                                        "Decision unchanged and REPEAT_SAME_MORSE=false, skipping repeated Morse."
+                                    )
+                                else:
+                                    signal_morse(config, morse)
+                                last_decision = decision
+                            else:
+                                log("Running Function 3: capture + Gemini room summary")
+                                summary, morse = run_room_description_check(config)
+                                if (
+                                    summary == last_room_summary
+                                    and not config.repeat_same_morse
+                                ):
+                                    log(
+                                        "Room summary unchanged and REPEAT_SAME_MORSE=false, skipping repeated Morse."
+                                    )
+                                else:
+                                    signal_morse(config, morse)
+                                last_room_summary = summary
+                        except Exception as exc:
+                            log(f"Function {selector_index + 1} error: {exc}")
+                        finally:
+                            clear_all_outputs(config)
+                            selector_index = None
+                            log_selector_menu(config)
+                        continue
 
             if not mode1_enabled or selector_index is None:
                 time.sleep(config.main_loop_sleep_seconds)
                 continue
 
-            if selector_index == 0:
-                if now - last_vision_at >= config.vision_interval_seconds:
-                    log("Running Function 1: capture + Gemini human-presence check")
-                    try:
-                        decision, morse = run_vision_check(config)
-                        if decision == last_decision and not config.repeat_same_morse:
-                            log(
-                                "Decision unchanged and REPEAT_SAME_MORSE=false, skipping repeated Morse."
-                            )
-                        else:
-                            signal_morse(config, morse)
-                        last_decision = decision
-                    except Exception as exc:
-                        log(f"Function 1 error: {exc}")
-                    finally:
-                        clear_all_outputs(config)
-                    last_vision_at = time.monotonic()
-                else:
-                    time.sleep(config.main_loop_sleep_seconds)
-            elif selector_index == 1:
+            if selector_index == 1:
                 if now - last_distance_read_at >= config.distance_read_interval_seconds:
                     last_distance_cm = measure_distance_cm(config)
                     last_distance_read_at = now
@@ -887,25 +984,6 @@ def main() -> None:
                     last_distance_log_at = now
 
                 time.sleep(config.main_loop_sleep_seconds)
-            else:
-                if now - last_room_summary_at >= config.vision_interval_seconds:
-                    log("Running Function 3: capture + Gemini room summary")
-                    try:
-                        summary, morse = run_room_description_check(config)
-                        if summary == last_room_summary and not config.repeat_same_morse:
-                            log(
-                                "Room summary unchanged and REPEAT_SAME_MORSE=false, skipping repeated Morse."
-                            )
-                        else:
-                            signal_morse(config, morse)
-                        last_room_summary = summary
-                    except Exception as exc:
-                        log(f"Function 3 error: {exc}")
-                    finally:
-                        clear_all_outputs(config)
-                    last_room_summary_at = time.monotonic()
-                else:
-                    time.sleep(config.main_loop_sleep_seconds)
     except KeyboardInterrupt:
         log("Keyboard interrupt received, shutting down.")
     finally:
