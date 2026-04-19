@@ -4,7 +4,7 @@ import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict
+from typing import Dict, List, Optional, Tuple
 
 import cv2
 import requests
@@ -66,8 +66,12 @@ class AppConfig:
     model: str
     decision_question: str
     camera_index: int
+    camera_device: str
+    camera_backends: str
     frame_width: int
     frame_height: int
+    camera_warmup_frames: int
+    camera_read_attempts: int
     save_capture: bool
     capture_path: Path
     pin_mode: str
@@ -96,8 +100,12 @@ def load_config() -> AppConfig:
         model=os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite-preview").strip(),
         decision_question=decision_question,
         camera_index=int(os.getenv("CAMERA_INDEX", "0")),
+        camera_device=os.getenv("CAMERA_DEVICE", "").strip(),
+        camera_backends=os.getenv("CAMERA_BACKENDS", "V4L2,ANY").strip(),
         frame_width=int(os.getenv("FRAME_WIDTH", "1280")),
         frame_height=int(os.getenv("FRAME_HEIGHT", "720")),
+        camera_warmup_frames=int(os.getenv("CAMERA_WARMUP_FRAMES", "8")),
+        camera_read_attempts=int(os.getenv("CAMERA_READ_ATTEMPTS", "20")),
         save_capture=os.getenv("SAVE_CAPTURE", "true").strip().lower() == "true",
         capture_path=Path(os.getenv("CAPTURE_PATH", "captures/latest.jpg")),
         pin_mode=pin_mode,
@@ -107,23 +115,80 @@ def load_config() -> AppConfig:
     )
 
 
+def parse_camera_backends(raw: str) -> List[Tuple[str, int]]:
+    mapping = {
+        "ANY": cv2.CAP_ANY,
+        "V4L2": getattr(cv2, "CAP_V4L2", None),
+        "GSTREAMER": getattr(cv2, "CAP_GSTREAMER", None),
+        "FFMPEG": getattr(cv2, "CAP_FFMPEG", None),
+    }
+    result: List[Tuple[str, int]] = []
+    seen = set()
+    for token in raw.split(","):
+        name = token.strip().upper()
+        if not name or name in seen:
+            continue
+        if name not in mapping:
+            raise ValueError(
+                f"Unknown backend {name!r}. Use comma-separated ANY,V4L2,GSTREAMER,FFMPEG."
+            )
+        value = mapping[name]
+        if value is None:
+            continue
+        seen.add(name)
+        result.append((name, value))
+    if not result:
+        result.append(("ANY", cv2.CAP_ANY))
+    return result
+
+
+def open_camera(config: AppConfig) -> Tuple[cv2.VideoCapture, str, str]:
+    source_obj: object
+    source_label: str
+    if config.camera_device:
+        source_obj = config.camera_device
+        source_label = config.camera_device
+    else:
+        source_obj = config.camera_index
+        source_label = f"index {config.camera_index}"
+
+    last_error: Optional[str] = None
+    for backend_name, backend_value in parse_camera_backends(config.camera_backends):
+        cap = cv2.VideoCapture(source_obj, backend_value)
+        if cap.isOpened():
+            return cap, backend_name, source_label
+        cap.release()
+        last_error = f"failed to open source {source_label} with backend {backend_name}"
+
+    raise RuntimeError(last_error or f"Could not open camera source {source_label}.")
+
+
 def capture_frame(config: AppConfig) -> bytes:
-    cap = cv2.VideoCapture(config.camera_index)
-    if not cap.isOpened():
-        raise RuntimeError(f"Could not open camera index {config.camera_index}.")
+    cap, backend_name, source_label = open_camera(config)
 
     try:
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, config.frame_width)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, config.frame_height)
+        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
 
         # Warm-up frames improve exposure/autofocus stability.
-        for _ in range(5):
+        for _ in range(config.camera_warmup_frames):
             cap.read()
             time.sleep(0.05)
 
-        ok, frame = cap.read()
+        ok = False
+        frame = None
+        for _ in range(config.camera_read_attempts):
+            ok, frame = cap.read()
+            if ok and frame is not None:
+                break
+            time.sleep(0.05)
         if not ok or frame is None:
-            raise RuntimeError("Camera frame capture failed.")
+            raise RuntimeError(
+                "Camera frame capture failed. "
+                f"Source={source_label}, backend={backend_name}. "
+                "Check camera with: ls /dev/video* and v4l2-ctl --list-devices."
+            )
 
         ok, jpg = cv2.imencode(".jpg", frame)
         if not ok:
